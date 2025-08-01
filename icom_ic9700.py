@@ -6,8 +6,8 @@ over network using the ICOM RS-BA Protocol over UDP ports 50001, 50002, and 5000
 
 ICOM RS-BA Protocol Structure:
 - Port 50001: UDP Control Port (login, connect, ping/idle messages)
-- Port 50002: UDP Serial Port (CI-V commands after connection)
-- Port 50003: UDP Audio Port (audio samples and ready handshake)
+- Port 50002: UDP Data Stream / CI-V Port (CI-V commands after connection)
+- Port 50003: UDP Audio Stream Port (audio samples and ready handshake)
 
 Connection Process:
 1. Login phase with credentials (n4ldr/icom9700) on port 50001
@@ -96,8 +96,8 @@ class ICOMIC9700Controller:
         Args:
             radio_ip: IP address of the IC-9700
             control_port: UDP port for control/login (default: 50001)
-            serial_port: UDP port for CI-V commands (default: 50002)
-            audio_port: UDP port for audio stream (default: 50003)
+            serial_port: UDP port for Data Stream/CI-V commands (default: 50002)
+            audio_port: UDP port for Audio Stream (default: 50003)
             username: Login username (default: n4ldr)
             password: Login password (default: icom9700)
         """

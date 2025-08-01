@@ -10,8 +10,8 @@ This is a Python project for controlling the ICOM IC-9700 amateur radio transcei
 - **Communication Protocol**: ICOM RS-BA Protocol over UDP with embedded CI-V commands
 - **Network Ports**:
   - 50001: UDP Control Port (non-CI-V login, connect, ping messages)
-  - 50002: UDP Serial Port (CI-V commands after successful connection)
-  - 50003: UDP Audio Port (audio samples and control messages)
+  - 50002: UDP Data Stream / CI-V Port (CI-V commands after successful connection)
+  - 50003: UDP Audio Stream Port (audio samples and control messages)
 - **Target Hardware**: ICOM IC-9700 VHF/UHF/SHF transceiver
 - **Authentication**: Username: n4ldr, Password: icom9700
 
@@ -27,10 +27,10 @@ This is a Python project for controlling the ICOM IC-9700 amateur radio transcei
 
 - **ICOM RS-BA Protocol**: Multi-phase connection protocol with login, connect, and ready phases
 - **UDP Control Port (50001)**: Handles login credentials, connection establishment, and ping/idle messages
-- **UDP Serial Port (50002)**: Carries CI-V commands after successful connection establishment
-- **UDP Audio Port (50003)**: Handles audio samples and "are-you-ready"/"I-am-ready" negotiations
+- **UDP Data Stream / CI-V Port (50002)**: Carries CI-V commands after successful connection establishment
+- **UDP Audio Stream Port (50003)**: Handles audio samples and "are-you-ready"/"I-am-ready" negotiations
 - **CI-V Format**: FE FE [to] [from] [command] [parameters] FD embedded in UDP frames
-- **Connection Phases**: 
+- **Connection Phases**:
   1. Login with credentials on port 50001
   2. Connect negotiation on all ports
   3. Ready handshake before CI-V polling begins

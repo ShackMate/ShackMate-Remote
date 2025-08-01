@@ -6,7 +6,7 @@ A Python-based control system for the ICOM IC-9700 VHF/UHF/SHF amateur radio tra
 
 - **ICOM RS-BA Protocol**: Full implementation of ICOM's network protocol with authentication
 - **Multi-Phase Connection**: Login, connect, and ready handshake sequence
-- **Network Communication**: Communicates via UDP on ports 50001 (control) and 50002 (CI-V serial)
+- **Network Communication**: Communicates via UDP on ports 50001 (control) and 50002 (Data Stream/CI-V)
 - **Authentication**: Secure login with configurable credentials (default: n4ldr/icom9700)
 - **Keep-Alive Support**: Automatic ping and idle messages to maintain connection
 - **Frequency Control**: Read and set operating frequency across all bands
@@ -27,9 +27,9 @@ A Python-based control system for the ICOM IC-9700 VHF/UHF/SHF amateur radio tra
 
 The IC-9700 uses three UDP ports for network communication:
 
-- **Port 50001**: Control commands and responses (CI-V protocol)
-- **Port 50002**: Audio stream data
-- **Port 50003**: Additional CI-V data stream
+- **Port 50001**: Control Port (login, connect, ping messages)
+- **Port 50002**: Data Stream / CI-V Port (CI-V commands after connection)
+- **Port 50003**: Audio Stream Port (audio samples and control messages)
 
 Make sure these ports are configured and accessible on your IC-9700.
 
@@ -50,12 +50,12 @@ pip install -r requirements.txt
 Run the main control script with authentication:
 
 ```bash
-python sm-control.py --radio-ip 192.168.1.100 --username n4ldr --password icom9700
+python sm-control.py --radio-ip n4ldr.ddns.net --username n4ldr --password icom9700
 ```
 
 ### Command Line Options
 
-- `--radio-ip`: IP address of the IC-9700 (default: 192.168.1.100)
+- `--radio-ip`: IP address or hostname of the IC-9700 (default: n4ldr.ddns.net)
 - `--username`: RS-BA username for authentication (default: n4ldr)
 - `--password`: RS-BA password for authentication (default: icom9700)
 - `--verbose`, `-v`: Enable verbose logging

@@ -5,8 +5,8 @@ Main control script for connecting to and controlling the ICOM IC-9700 radio ove
 
 Default UDP Ports:
 - 50001: Control Port
-- 50002: Audio Stream Port  
-- 50003: Data Stream Port
+- 50002: Data Stream / CI-V Port
+- 50003: Audio Stream Port
 """
 
 import asyncio
@@ -24,12 +24,12 @@ logger = logging.getLogger(__name__)
 class SMControlApp:
     """Main application class for SM-Control system."""
     
-    def __init__(self, radio_ip: str = "192.168.1.100", 
+    def __init__(self, radio_ip: str = "n4ldr.ddns.net", 
                  username: str = "n4ldr", password: str = "icom9700"):
         """Initialize the SM-Control application.
         
         Args:
-            radio_ip: IP address of the ICOM IC-9700 radio
+            radio_ip: IP address or hostname of the ICOM IC-9700 radio
             username: RS-BA login username
             password: RS-BA login password
         """
@@ -107,8 +107,8 @@ async def main():
     parser = argparse.ArgumentParser(description="SM-Control: ICOM IC-9700 Radio Control")
     parser.add_argument(
         "--radio-ip", 
-        default="192.168.1.100",
-        help="IP address of the ICOM IC-9700 radio (default: 192.168.1.100)"
+        default="n4ldr.ddns.net",
+        help="IP address or hostname of the ICOM IC-9700 radio (default: n4ldr.ddns.net)"
     )
     parser.add_argument(
         "--username", "-u",
