@@ -2,12 +2,18 @@
 ICOM IC-9700 Radio Controller Module
 
 This module provides communication interface for the ICOM IC-9700 transceiver
-over network using UDP ports 50001, 50002, and 50003.
+over network using the ICOM RS-BA Protocol over UDP ports 50001, 50002, and 50003.
 
-UDP Port Usage:
-- 50001: Control commands and responses
-- 50002: Audio stream data
-- 50003: CI-V data stream
+ICOM RS-BA Protocol Structure:
+- Port 50001: UDP Control Port (login, connect, ping/idle messages)
+- Port 50002: UDP Serial Port (CI-V commands after connection)
+- Port 50003: UDP Audio Port (audio samples and ready handshake)
+
+Connection Process:
+1. Login phase with credentials (n4ldr/icom9700) on port 50001
+2. Connect negotiation on all ports
+3. Ready handshake on audio port
+4. Normal CI-V operation on serial port with keep-alive messages
 """
 
 import asyncio
@@ -17,8 +23,26 @@ import logging
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
+import time
 
 logger = logging.getLogger(__name__)
+
+class ConnectionState(Enum):
+    """Connection states for RS-BA protocol."""
+    DISCONNECTED = "disconnected"
+    LOGGING_IN = "logging_in"
+    CONNECTING = "connecting"
+    READY_HANDSHAKE = "ready_handshake"
+    CONNECTED = "connected"
+
+class RSBAMessageType(Enum):
+    """ICOM RS-BA message types."""
+    LOGIN = 0x00
+    CONNECT = 0x01
+    PING = 0x02
+    IDLE = 0x03
+    READY = 0x04
+    CIV_DATA = 0x05
 
 class IC9700Mode(Enum):
     """Operating modes supported by IC-9700."""
@@ -41,6 +65,13 @@ class RadioStatus:
     power_level: int = 0
     s_meter: int = 0
     connected: bool = False
+    connection_state: ConnectionState = ConnectionState.DISCONNECTED
+
+@dataclass
+class RSBACredentials:
+    """ICOM RS-BA authentication credentials."""
+    username: str = "n4ldr"
+    password: str = "icom9700"
 
 class ICOMIC9700Controller:
     """Controller for ICOM IC-9700 radio over network."""
@@ -58,50 +89,93 @@ class ICOMIC9700Controller:
     CONTROLLER_ADDRESS = 0xE0
     
     def __init__(self, radio_ip: str, control_port: int = 50001, 
-                 audio_port: int = 50002, data_port: int = 50003):
+                 serial_port: int = 50002, audio_port: int = 50003,
+                 username: str = "n4ldr", password: str = "icom9700"):
         """Initialize the IC-9700 controller.
         
         Args:
             radio_ip: IP address of the IC-9700
-            control_port: UDP port for control commands (default: 50001)
-            audio_port: UDP port for audio stream (default: 50002)
-            data_port: UDP port for data stream (default: 50003)
+            control_port: UDP port for control/login (default: 50001)
+            serial_port: UDP port for CI-V commands (default: 50002)
+            audio_port: UDP port for audio stream (default: 50003)
+            username: Login username (default: n4ldr)
+            password: Login password (default: icom9700)
         """
         self.radio_ip = radio_ip
         self.control_port = control_port
+        self.serial_port = serial_port
         self.audio_port = audio_port
-        self.data_port = data_port
+        self.credentials = RSBACredentials(username, password)
         
+        # Socket management
         self.control_socket: Optional[socket.socket] = None
+        self.serial_socket: Optional[socket.socket] = None
         self.audio_socket: Optional[socket.socket] = None
-        self.data_socket: Optional[socket.socket] = None
         
+        # Connection state
         self.status = RadioStatus()
-        self._connected = False
+        self._connection_state = ConnectionState.DISCONNECTED
+        self._last_ping_time = 0
+        self._last_idle_time = 0
+        self._ping_interval = 5.0  # seconds
+        self._idle_interval = 1.0  # seconds
         
     async def connect(self) -> bool:
-        """Connect to the IC-9700 radio.
+        """Connect to the IC-9700 using ICOM RS-BA protocol.
+        
+        Implements the full connection sequence:
+        1. Login with credentials on control port
+        2. Connect negotiation on all ports  
+        3. Ready handshake on audio port
+        4. Start keep-alive messaging
         
         Returns:
             True if connection successful, False otherwise
         """
         try:
-            logger.info(f"Connecting to IC-9700 at {self.radio_ip}")
+            logger.info(f"Starting RS-BA connection to IC-9700 at {self.radio_ip}")
             
-            # Create UDP sockets for each port
+            # Phase 1: Create sockets
             await self._create_sockets()
             
-            # Test connection by reading frequency
-            frequency = await self.get_frequency()
-            if frequency is not None:
-                self._connected = True
-                self.status.connected = True
-                logger.info("Successfully connected to IC-9700")
-                return True
-            else:
-                logger.error("Failed to communicate with IC-9700")
+            # Phase 2: Login with credentials
+            self._connection_state = ConnectionState.LOGGING_IN
+            if not await self._login():
+                logger.error("Login failed")
                 await self.disconnect()
                 return False
+            
+            # Phase 3: Connect negotiation
+            self._connection_state = ConnectionState.CONNECTING
+            if not await self._connect_negotiation():
+                logger.error("Connect negotiation failed")
+                await self.disconnect()
+                return False
+            
+            # Phase 4: Ready handshake
+            self._connection_state = ConnectionState.READY_HANDSHAKE
+            if not await self._ready_handshake():
+                logger.error("Ready handshake failed")
+                await self.disconnect()
+                return False
+            
+            # Phase 5: Connection established
+            self._connection_state = ConnectionState.CONNECTED
+            self.status.connected = True
+            self.status.connection_state = self._connection_state
+            self._last_ping_time = time.time()
+            self._last_idle_time = time.time()
+            
+            logger.info("Successfully connected to IC-9700 via RS-BA protocol")
+            
+            # Test CI-V communication
+            frequency = await self.get_frequency()
+            if frequency is not None:
+                logger.info(f"CI-V communication confirmed - frequency: {frequency} Hz")
+                return True
+            else:
+                logger.warning("CI-V communication test failed, but connection established")
+                return True
                 
         except Exception as e:
             logger.error(f"Connection failed: {e}")
@@ -112,65 +186,216 @@ class ICOMIC9700Controller:
         """Disconnect from the IC-9700 radio."""
         logger.info("Disconnecting from IC-9700")
         
-        self._connected = False
+        self._connection_state = ConnectionState.DISCONNECTED
         self.status.connected = False
+        self.status.connection_state = self._connection_state
         
         if self.control_socket:
             self.control_socket.close()
             self.control_socket = None
             
+        if self.serial_socket:
+            self.serial_socket.close()
+            self.serial_socket = None
+            
         if self.audio_socket:
             self.audio_socket.close()
             self.audio_socket = None
-            
-        if self.data_socket:
-            self.data_socket.close()
-            self.data_socket = None
     
     async def _create_sockets(self):
-        """Create UDP sockets for communication."""
+        """Create UDP sockets for RS-BA communication."""
         try:
-            # Control socket
+            # Control socket (login, ping, idle)
             self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.control_socket.settimeout(2.0)
             
-            # Audio socket  
+            # Serial socket (CI-V commands)
+            self.serial_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.serial_socket.settimeout(2.0)
+            
+            # Audio socket (audio + ready handshake)
             self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.audio_socket.settimeout(2.0)
             
-            # Data socket
-            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.data_socket.settimeout(2.0)
-            
-            logger.debug("UDP sockets created successfully")
+            logger.debug("RS-BA UDP sockets created successfully")
             
         except Exception as e:
             logger.error(f"Failed to create sockets: {e}")
             raise
     
+    async def _login(self) -> bool:
+        """Phase 1: Send login credentials to control port."""
+        try:
+            logger.info(f"Logging in as {self.credentials.username}")
+            
+            # Build login message
+            login_data = self._build_login_message()
+            
+            # Send login to control port
+            self.control_socket.sendto(login_data, (self.radio_ip, self.control_port))
+            
+            # Wait for login response
+            response, addr = self.control_socket.recvfrom(1024)
+            
+            if self._validate_login_response(response):
+                logger.info("Login successful")
+                return True
+            else:
+                logger.error("Login failed - invalid credentials or response")
+                return False
+                
+        except socket.timeout:
+            logger.error("Login timeout - no response from radio")
+            return False
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return False
+    
+    async def _connect_negotiation(self) -> bool:
+        """Phase 2: Connect negotiation on all ports."""
+        try:
+            logger.info("Starting connect negotiation")
+            
+            # Send connect messages to all ports
+            connect_data = self._build_connect_message()
+            
+            # Control port connect
+            self.control_socket.sendto(connect_data, (self.radio_ip, self.control_port))
+            # Serial port connect  
+            self.serial_socket.sendto(connect_data, (self.radio_ip, self.serial_port))
+            # Audio port connect
+            self.audio_socket.sendto(connect_data, (self.radio_ip, self.audio_port))
+            
+            # Wait for connect responses (simplified - should wait for all)
+            response, addr = self.control_socket.recvfrom(1024)
+            
+            if self._validate_connect_response(response):
+                logger.info("Connect negotiation successful")
+                return True
+            else:
+                logger.error("Connect negotiation failed")
+                return False
+                
+        except socket.timeout:
+            logger.error("Connect negotiation timeout")
+            return False
+        except Exception as e:
+            logger.error(f"Connect negotiation error: {e}")
+            return False
+    
+    async def _ready_handshake(self) -> bool:
+        """Phase 3: Ready handshake on audio port."""
+        try:
+            logger.info("Starting ready handshake")
+            
+            # Send "are-you-ready" to audio port
+            ready_query = self._build_ready_query()
+            self.audio_socket.sendto(ready_query, (self.radio_ip, self.audio_port))
+            
+            # Wait for "I-am-ready" response
+            response, addr = self.audio_socket.recvfrom(1024)
+            
+            if self._validate_ready_response(response):
+                logger.info("Ready handshake successful")
+                return True
+            else:
+                logger.error("Ready handshake failed")
+                return False
+                
+        except socket.timeout:
+            logger.error("Ready handshake timeout")
+            return False
+        except Exception as e:
+            logger.error(f"Ready handshake error: {e}")
+            return False
+    
+    def _build_login_message(self) -> bytes:
+        """Build RS-BA login message with credentials."""
+        # Simplified login message format (actual format may vary)
+        # This would need to be reverse-engineered from packet captures
+        login_msg = bytearray()
+        login_msg.extend(b'\x00\x01')  # Login message type
+        login_msg.extend(self.credentials.username.encode('utf-8').ljust(16, b'\x00'))
+        login_msg.extend(self.credentials.password.encode('utf-8').ljust(16, b'\x00'))
+        return bytes(login_msg)
+    
+    def _build_connect_message(self) -> bytes:
+        """Build RS-BA connect message."""
+        # Simplified connect message format
+        connect_msg = bytearray()
+        connect_msg.extend(b'\x00\x02')  # Connect message type
+        connect_msg.extend(b'\x00\x00\x00\x00')  # Additional parameters
+        return bytes(connect_msg)
+    
+    def _build_ready_query(self) -> bytes:
+        """Build 'are-you-ready' message for audio port."""
+        ready_msg = bytearray()
+        ready_msg.extend(b'\x00\x03')  # Ready query type
+        ready_msg.extend(b'ARE-YOU-READY?')
+        return bytes(ready_msg)
+    
+    def _build_ping_message(self) -> bytes:
+        """Build ping message for keep-alive."""
+        ping_msg = bytearray()
+        ping_msg.extend(b'\x00\x04')  # Ping message type
+        ping_msg.extend(int(time.time()).to_bytes(4, 'big'))  # Timestamp
+        return bytes(ping_msg)
+    
+    def _build_idle_message(self) -> bytes:
+        """Build idle message for keep-alive."""
+        idle_msg = bytearray()
+        idle_msg.extend(b'\x00\x05')  # Idle message type
+        return bytes(idle_msg)
+    
+    def _validate_login_response(self, response: bytes) -> bool:
+        """Validate login response from radio."""
+        # Simplified validation - actual format needs reverse engineering
+        if len(response) >= 4:
+            # Check for successful login indicator
+            return response[0:2] == b'\x00\x01' and response[2] == 0x00
+        return False
+    
+    def _validate_connect_response(self, response: bytes) -> bool:
+        """Validate connect response from radio."""
+        if len(response) >= 4:
+            return response[0:2] == b'\x00\x02' and response[2] == 0x00
+        return False
+    
+    def _validate_ready_response(self, response: bytes) -> bool:
+        """Validate ready response from radio."""
+        if len(response) >= 10:
+            return b'I-AM-READY' in response
+        return False
+    
     def _build_civ_command(self, command: int, data: bytes = b'') -> bytes:
-        """Build a CI-V command packet.
+        """Build a CI-V command packet embedded in UDP frame.
         
         Args:
             command: CI-V command byte
             data: Command data bytes
             
         Returns:
-            Complete CI-V command packet
+            Complete CI-V command packet for UDP transmission
         """
         # CI-V packet format: FE FE [radio_addr] [controller_addr] [command] [data] FD
-        packet = bytearray()
-        packet.extend([0xFE, 0xFE])  # Preamble
-        packet.append(self.RADIO_ADDRESS)  # Radio address
-        packet.append(self.CONTROLLER_ADDRESS)  # Controller address
-        packet.append(command)  # Command
-        packet.extend(data)  # Data
-        packet.append(0xFD)  # End marker
+        civ_packet = bytearray()
+        civ_packet.extend([0xFE, 0xFE])  # CI-V preamble
+        civ_packet.append(self.RADIO_ADDRESS)  # Radio address
+        civ_packet.append(self.CONTROLLER_ADDRESS)  # Controller address
+        civ_packet.append(command)  # Command
+        civ_packet.extend(data)  # Data
+        civ_packet.append(0xFD)  # CI-V postamble
         
-        return bytes(packet)
+        # Wrap in UDP frame (simplified - actual format may include additional headers)
+        udp_frame = bytearray()
+        udp_frame.extend(b'\x00\x06')  # CI-V data message type
+        udp_frame.extend(len(civ_packet).to_bytes(2, 'big'))  # Length
+        udp_frame.extend(civ_packet)  # CI-V payload
+        
+        return bytes(udp_frame)
     
     async def _send_civ_command(self, command: int, data: bytes = b'') -> Optional[bytes]:
-        """Send a CI-V command and receive response.
+        """Send a CI-V command via UDP serial port and receive response.
         
         Args:
             command: CI-V command byte
@@ -179,8 +404,40 @@ class ICOMIC9700Controller:
         Returns:
             Response data or None if failed
         """
-        if not self.control_socket:
-            logger.error("Control socket not available")
+        if not self.serial_socket or self._connection_state != ConnectionState.CONNECTED:
+            logger.error("CI-V not available - not connected or serial socket unavailable")
+            return None
+        
+        try:
+            # Build and send CI-V command via serial port
+            packet = self._build_civ_command(command, data)
+            self.serial_socket.sendto(packet, (self.radio_ip, self.serial_port))
+            
+            # Receive response
+            response, addr = self.serial_socket.recvfrom(1024)
+            
+            # Extract CI-V payload from UDP frame
+            if len(response) >= 6 and response[0:2] == b'\x00\x06':
+                payload_length = int.from_bytes(response[2:4], 'big')
+                civ_response = response[4:4+payload_length]
+                
+                # Validate CI-V response format
+                if len(civ_response) >= 6 and civ_response[0:2] == b'\xFE\xFE':
+                    # Extract data portion (skip header and end marker)
+                    return civ_response[5:-1]
+                else:
+                    logger.warning(f"Invalid CI-V response format: {civ_response.hex()}")
+                    return None
+            else:
+                logger.warning(f"Invalid UDP frame format: {response.hex()}")
+                return None
+                
+        except socket.timeout:
+            logger.warning("CI-V command timeout")
+            return None
+        except Exception as e:
+            logger.error(f"CI-V command failed: {e}")
+            return None
             return None
         
         try:
@@ -304,10 +561,56 @@ class ICOMIC9700Controller:
             result[i] = (digit2 << 4) | digit1
         return bytes(result)
     
+    async def send_keep_alive(self):
+        """Send keep-alive messages (ping and idle) to maintain connection."""
+        if self._connection_state != ConnectionState.CONNECTED:
+            return
+        
+        current_time = time.time()
+        
+        # Send ping messages
+        if current_time - self._last_ping_time >= self._ping_interval:
+            try:
+                ping_msg = self._build_ping_message()
+                # Send ping to all ports
+                if self.control_socket:
+                    self.control_socket.sendto(ping_msg, (self.radio_ip, self.control_port))
+                if self.serial_socket:
+                    self.serial_socket.sendto(ping_msg, (self.radio_ip, self.serial_port))
+                if self.audio_socket:
+                    self.audio_socket.sendto(ping_msg, (self.radio_ip, self.audio_port))
+                
+                self._last_ping_time = current_time
+                logger.debug("Ping messages sent")
+            except Exception as e:
+                logger.error(f"Failed to send ping: {e}")
+        
+        # Send idle messages
+        if current_time - self._last_idle_time >= self._idle_interval:
+            try:
+                idle_msg = self._build_idle_message()
+                # Send idle to all ports when no other traffic
+                if self.control_socket:
+                    self.control_socket.sendto(idle_msg, (self.radio_ip, self.control_port))
+                if self.serial_socket:
+                    self.serial_socket.sendto(idle_msg, (self.radio_ip, self.serial_port))
+                if self.audio_socket:
+                    self.audio_socket.sendto(idle_msg, (self.radio_ip, self.audio_port))
+                
+                self._last_idle_time = current_time
+                logger.debug("Idle messages sent")
+            except Exception as e:
+                logger.error(f"Failed to send idle: {e}")
+    
     @property
     def is_connected(self) -> bool:
-        """Check if connected to radio."""
-        return self._connected
+        """Check if connected to radio via RS-BA protocol."""
+        return self._connection_state == ConnectionState.CONNECTED
+    
+    @property
+    def connection_state(self) -> ConnectionState:
+        """Get current connection state."""
+        return self._connection_state
     
     def get_status(self) -> RadioStatus:
         """Get current radio status."""

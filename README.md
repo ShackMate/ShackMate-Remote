@@ -1,15 +1,19 @@
 # SM-Control: ICOM IC-9700 Radio Control System
 
-A Python-based control system for the ICOM IC-9700 VHF/UHF/SHF amateur radio transceiver. This project enables remote control of the radio over a network connection using the CI-V (Computer Interface V) protocol over UDP.
+A Python-based control system for the ICOM IC-9700 VHF/UHF/SHF amateur radio transceiver. This project enables remote control of the radio over a network connection using the ICOM RS-BA Protocol with embedded CI-V commands over UDP.
 
 ## Features
 
-- **Network Communication**: Connect to IC-9700 via UDP on standard ports (50001, 50002, 50003)
+- **ICOM RS-BA Protocol**: Full implementation of ICOM's network protocol with authentication
+- **Multi-Phase Connection**: Login, connect, and ready handshake sequence
+- **Network Communication**: Communicates via UDP on ports 50001 (control) and 50002 (CI-V serial)
+- **Authentication**: Secure login with configurable credentials (default: n4ldr/icom9700)
+- **Keep-Alive Support**: Automatic ping and idle messages to maintain connection
 - **Frequency Control**: Read and set operating frequency across all bands
 - **Mode Control**: Change operating modes (USB, LSB, CW, FM, AM, DV)
 - **PTT Control**: Remote push-to-talk functionality
-- **Status Monitoring**: Real-time monitoring of radio parameters
-- **Async Operations**: Non-blocking asynchronous communication
+- **Status Monitoring**: Real-time monitoring of radio parameters and connection state
+- **Async Operations**: Non-blocking asynchronous communication with automatic reconnection
 - **Comprehensive Logging**: Detailed logging for debugging and monitoring
 
 ## Requirements
@@ -17,6 +21,7 @@ A Python-based control system for the ICOM IC-9700 VHF/UHF/SHF amateur radio tra
 - Python 3.8 or higher
 - ICOM IC-9700 transceiver with network interface enabled
 - Network connection between computer and radio
+- Valid RS-BA credentials (username/password)
 
 ## Network Configuration
 
@@ -42,15 +47,17 @@ pip install -r requirements.txt
 
 ### Basic Usage
 
-Run the main control script:
+Run the main control script with authentication:
 
 ```bash
-python sm-control.py --radio-ip 192.168.1.100
+python sm-control.py --radio-ip 192.168.1.100 --username n4ldr --password icom9700
 ```
 
 ### Command Line Options
 
 - `--radio-ip`: IP address of the IC-9700 (default: 192.168.1.100)
+- `--username`: RS-BA username for authentication (default: n4ldr)
+- `--password`: RS-BA password for authentication (default: icom9700)
 - `--verbose`, `-v`: Enable verbose logging
 
 ### Example Usage

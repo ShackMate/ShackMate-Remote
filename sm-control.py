@@ -24,14 +24,19 @@ logger = logging.getLogger(__name__)
 class SMControlApp:
     """Main application class for SM-Control system."""
     
-    def __init__(self, radio_ip: str = "192.168.1.100"):
+    def __init__(self, radio_ip: str = "192.168.1.100", 
+                 username: str = "n4ldr", password: str = "icom9700"):
         """Initialize the SM-Control application.
         
         Args:
             radio_ip: IP address of the ICOM IC-9700 radio
+            username: RS-BA login username
+            password: RS-BA login password
         """
         self.radio_ip = radio_ip
-        self.radio_controller = ICOMIC9700Controller(radio_ip)
+        self.radio_controller = ICOMIC9700Controller(
+            radio_ip, username=username, password=password
+        )
         self.running = False
         
     async def start(self):
@@ -61,20 +66,27 @@ class SMControlApp:
         logger.info("SM-Control stopped")
     
     async def main_loop(self):
-        """Main application loop."""
+        """Main application loop with keep-alive support."""
         logger.info("SM-Control main loop started")
         
         try:
             while self.running:
+                # Send keep-alive messages to maintain connection
+                await self.radio_controller.send_keep_alive()
+                
                 # Example: Get current frequency
                 frequency = await self.radio_controller.get_frequency()
                 if frequency:
-                    logger.info(f"Current frequency: {frequency} Hz")
+                    logger.info(f"Current frequency: {frequency:,} Hz")
                 
                 # Example: Get current mode
                 mode = await self.radio_controller.get_mode()
                 if mode:
-                    logger.info(f"Current mode: {mode}")
+                    logger.info(f"Current mode: {mode.name}")
+                
+                # Log connection state
+                state = self.radio_controller.connection_state
+                logger.debug(f"Connection state: {state.value}")
                 
                 # Wait before next update
                 await asyncio.sleep(5)
@@ -83,6 +95,10 @@ class SMControlApp:
             logger.info("Received keyboard interrupt")
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
+            # Try to reconnect on error
+            if not self.radio_controller.is_connected:
+                logger.info("Attempting to reconnect...")
+                await self.radio_controller.connect()
 
 async def main():
     """Main entry point."""
@@ -93,6 +109,16 @@ async def main():
         "--radio-ip", 
         default="192.168.1.100",
         help="IP address of the ICOM IC-9700 radio (default: 192.168.1.100)"
+    )
+    parser.add_argument(
+        "--username", "-u",
+        default="n4ldr",
+        help="Login username for RS-BA protocol (default: n4ldr)"
+    )
+    parser.add_argument(
+        "--password", "-p",
+        default="icom9700",
+        help="Login password for RS-BA protocol (default: icom9700)"
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -106,7 +132,7 @@ async def main():
         logging.getLogger().setLevel(logging.DEBUG)
     
     # Create and start the application
-    app = SMControlApp(args.radio_ip)
+    app = SMControlApp(args.radio_ip, args.username, args.password)
     
     try:
         await app.start()
