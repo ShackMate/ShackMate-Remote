@@ -115,6 +115,8 @@ class ICOMIC9700Controller:
         # Connection state
         self.status = RadioStatus()
         self._connection_state = ConnectionState.DISCONNECTED
+        self._session_id = None
+        self._sequence_counter = 0
         self._last_ping_time = 0
         self._last_idle_time = 0
         self._ping_interval = 5.0  # seconds
@@ -227,15 +229,20 @@ class ICOMIC9700Controller:
         """Phase 1: Send login credentials to control port."""
         try:
             logger.info(f"Logging in as {self.credentials.username}")
+            logger.debug(f"Sending login to {self.radio_ip}:{self.control_port}")
             
             # Build login message
             login_data = self._build_login_message()
+            logger.debug(f"Login message size: {len(login_data)} bytes")
             
             # Send login to control port
-            self.control_socket.sendto(login_data, (self.radio_ip, self.control_port))
+            bytes_sent = self.control_socket.sendto(login_data, (self.radio_ip, self.control_port))
+            logger.debug(f"Sent {bytes_sent} bytes to control port")
             
             # Wait for login response
+            logger.debug("Waiting for login response...")
             response, addr = self.control_socket.recvfrom(1024)
+            logger.debug(f"Received {len(response)} bytes from {addr}")
             
             if self._validate_login_response(response):
                 logger.info("Login successful")
@@ -246,6 +253,7 @@ class ICOMIC9700Controller:
                 
         except socket.timeout:
             logger.error("Login timeout - no response from radio")
+            logger.debug(f"Timeout occurred after {self.control_socket.gettimeout()} seconds")
             return False
         except Exception as e:
             logger.error(f"Login error: {e}")
@@ -310,13 +318,27 @@ class ICOMIC9700Controller:
             return False
     
     def _build_login_message(self) -> bytes:
-        """Build RS-BA login message with credentials."""
-        # Simplified login message format (actual format may vary)
-        # This would need to be reverse-engineered from packet captures
+        """Build RS-BA login message based on actual protocol capture.
+        
+        First packet from working SDR-CONTROL capture:
+        10 00 00 00 04 00 00 00 db 5b 28 bc 2f c9 fe 0f
+        """
         login_msg = bytearray()
-        login_msg.extend(b'\x00\x01')  # Login message type
-        login_msg.extend(self.credentials.username.encode('utf-8').ljust(16, b'\x00'))
-        login_msg.extend(self.credentials.password.encode('utf-8').ljust(16, b'\x00'))
+        
+        # Packet length (4 bytes, little endian) - 0x10 = 16 bytes
+        login_msg.extend(b'\x10\x00\x00\x00')
+        
+        # Command type (4 bytes, little endian) - 0x04 = login request
+        login_msg.extend(b'\x04\x00\x00\x00')
+        
+        # Session ID (8 bytes) - use the exact same one from capture
+        session_id = b'\xdb\x5b\x28\xbc\x2f\xc9\xfe\x0f'
+        login_msg.extend(session_id)
+        
+        # Store session ID for later use
+        self._session_id = session_id
+        
+        logger.debug(f"Built login message: {login_msg.hex()}")
         return bytes(login_msg)
     
     def _build_connect_message(self) -> bytes:
@@ -348,6 +370,38 @@ class ICOMIC9700Controller:
         return bytes(idle_msg)
     
     def _validate_login_response(self, response: bytes) -> bool:
+        """Validate login response from radio.
+        
+        Based on packet capture analysis, responses should follow the
+        same structure as requests with different command types.
+        """
+        logger.debug(f"Login response received: {response.hex()}")
+        
+        # Check minimum packet length (at least 16 bytes for header)
+        if len(response) < 16:
+            logger.debug("Response too short")
+            return False
+            
+        # Extract packet length (first 4 bytes, little endian)
+        packet_length = int.from_bytes(response[0:4], 'little')
+        logger.debug(f"Response packet length: {packet_length}")
+        
+        # Extract command type (bytes 4-8, little endian)
+        command_type = int.from_bytes(response[4:8], 'little')
+        logger.debug(f"Response command type: {command_type:08x}")
+        
+        # Extract session ID (bytes 8-16)
+        response_session = response[8:16]
+        logger.debug(f"Response session ID: {response_session.hex()}")
+        
+        # For login response, we expect specific command types
+        # Based on packet capture, successful login might have command type 0x01 or 0x06
+        if command_type in [0x01, 0x06]:
+            logger.debug("Login response appears successful")
+            return True
+        else:
+            logger.debug(f"Unexpected response command type: {command_type:08x}")
+            return False
         """Validate login response from radio."""
         # Simplified validation - actual format needs reverse engineering
         if len(response) >= 4:

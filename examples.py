@@ -17,8 +17,8 @@ async def basic_example():
     """Basic usage example."""
     logger.info("Starting basic example")
     
-    # Create controller (adjust IP as needed)
-    controller = ICOMIC9700Controller("192.168.1.100")
+    # Create controller with authentication
+    controller = ICOMIC9700Controller("n4ldr.ddns.net", username="n4ldr", password="icom9700")
     
     try:
         # Connect to radio
@@ -52,7 +52,7 @@ async def frequency_scan_example():
     """Example of scanning through frequencies."""
     logger.info("Starting frequency scan example")
     
-    controller = ICOMIC9700Controller("192.168.1.100")
+    controller = ICOMIC9700Controller("n4ldr.ddns.net", username="n4ldr", password="icom9700")
     
     try:
         if await controller.connect():
@@ -79,7 +79,7 @@ async def mode_test_example():
     """Example of testing different operating modes."""
     logger.info("Starting mode test example")
     
-    controller = ICOMIC9700Controller("192.168.1.100")
+    controller = ICOMIC9700Controller("n4ldr.ddns.net", username="n4ldr", password="icom9700")
     
     try:
         if await controller.connect():
