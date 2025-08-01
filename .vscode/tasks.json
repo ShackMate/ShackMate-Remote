@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run SM-Control",
+			"type": "shell",
+			"command": "/opt/shackmate/ShackMate/ShackMate-Remote/.venv/bin/python",
+			"args": [
+				"sm-control.py",
+				"--verbose"
+			],
+			"group": "build",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

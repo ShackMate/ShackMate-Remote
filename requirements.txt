@@ -1,0 +1,11 @@
+# SM-Control Python Dependencies
+# Core dependencies for ICOM IC-9700 radio control
+
+# No external dependencies required for basic UDP communication
+# All networking functionality uses Python's built-in socket library
+# asyncio is part of Python 3.7+ standard library
+
+# Optional dependencies for enhanced functionality:
+# pyserial>=3.5  # For direct serial CI-V communication if needed
+# numpy>=1.21.0  # For audio processing if implementing DSP features
+# matplotlib>=3.5.0  # For signal visualization and spectrum analysis
