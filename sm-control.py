@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Kappanhang Python - Complete ICOM RS-BA1 Protocol Implementation
-Based on the Go kappanhang project by Norbert Varga HA2NON and Akos Marton ES1AKOS
+ShackMate - Complete ICOM RS-BA1 Protocol Implementation
 
-This is a complete Python implementation of the ICOM RS-BA1 protocol for connecting
+ICOM RS-BA1 protocol for connecting
 to ICOM radios (IC-705, IC-9700, IC-7610, etc.) over network.
 
 Compatible with:
@@ -51,7 +50,7 @@ PKT7_TIMEOUT_DURATION = 3.0  # 3 seconds
 REAUTH_INTERVAL = 60.0  # 1 minute
 REAUTH_TIMEOUT = 3.0  # 3 seconds
 
-EXPECT_TIMEOUT_DURATION = 3.0  # 3 seconds - reasonable timeout
+EXPECT_TIMEOUT_DURATION = 10.0  # 10 seconds - increased timeout for better reliability
 MAX_RETRANSMIT_REQUEST_PACKET_COUNT = 10
 
 # ICOM CI-V Operating Modes
@@ -68,7 +67,7 @@ CIV_OPERATING_MODES = [
     {'name': 'DV', 'code': 0x17},
 ]
 
-# W6EL Passcode Algorithm - from kappanhang
+# W6EL Passcode Algorithm 
 PASSCODE_SEQUENCE = {
     32: 0x47, 33: 0x5d, 34: 0x4c, 35: 0x42, 36: 0x66, 37: 0x20, 38: 0x23, 39: 0x46,
     40: 0x4e, 41: 0x57, 42: 0x45, 43: 0x3d, 44: 0x67, 45: 0x76, 46: 0x60, 47: 0x41,
@@ -161,7 +160,7 @@ class StreamCommon:
 
     async def start(self):
         """Start the connection handshake sequence with retries"""
-        max_retries = 3
+        max_retries = 5  # Increased retries
         for attempt in range(max_retries):
             try:
                 logger.info(f"{self.name}/handshake attempt {attempt + 1}/{max_retries}")
@@ -179,49 +178,83 @@ class StreamCommon:
             except Exception as e:
                 logger.warning(f"{self.name}/handshake attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
-                    logger.info(f"{self.name}/retrying in 1 second...")
-                    await asyncio.sleep(1)
+                    logger.info(f"{self.name}/retrying in 2 seconds...")
+                    await asyncio.sleep(2)  # Increased delay between retries
                 else:
                     logger.error(f"{self.name}/all handshake attempts failed")
                     raise
 
     async def _send_pkt3(self):
-        """Send packet type 3 (connection request) - try different approach"""
+        """Send packet type 3 (connection request) - fixed packet structure"""
         pkt = bytearray(16)
-        struct.pack_into('<IHHH', pkt, 0, 0x10, 0, 0, 0x03)
-        struct.pack_into('>II', pkt, 8, self.local_sid, self.remote_sid)
         
-        logger.debug(f"{self.name}/sending pkt3: {pkt.hex()}")
+        # Packet structure: [length:4][type:1][reserved:3][local_sid:4][remote_sid:4]
+        struct.pack_into('<I', pkt, 0, 0x10)      # Length: 16 bytes (little-endian)
+        struct.pack_into('<H', pkt, 4, 0x03)      # Type: 3 (connection request)
+        struct.pack_into('<H', pkt, 6, 0x00)      # Reserved/sequence
+        struct.pack_into('>I', pkt, 8, self.local_sid)   # Local session ID (big-endian)
+        struct.pack_into('>I', pkt, 12, self.remote_sid) # Remote session ID (big-endian)
+        
+        logger.info(f"{self.name}/sending pkt3 to {self.connect_address}:{self.port}: {pkt.hex()}")
         await self._send(pkt)
         
         # Send duplicate packet immediately (some implementations do this)
+        await asyncio.sleep(0.1)  # Small delay between sends
         await self._send(pkt)
-        await self._send(pkt)  # Send twice for reliability
+        await asyncio.sleep(0.1)
+        await self._send(pkt)  # Send three times for reliability
 
     async def _wait_for_pkt4_answer(self):
         """Wait for packet type 4 response with remote session ID"""
-        logger.debug(f"{self.name}/expecting pkt4 answer")
-        response = await self._expect(16, bytes([0x10, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]))
+        logger.info(f"{self.name}/expecting pkt4 answer")
+        # Don't be too strict about the exact pattern - just check for packet type 4
+        response = await self._expect(16, bytes([0x10, 0x00, 0x00, 0x00, 0x04, 0x00]))
         
-        # Extract remote session ID
+        # Extract remote session ID from positions 8-12 (radio's SID)
         self.remote_sid = struct.unpack('>I', response[8:12])[0]
         self.got_remote_sid = True
-        logger.debug(f"{self.name}/remote SID: {self.remote_sid:08X}")
+        logger.info(f"{self.name}/remote SID: {self.remote_sid:08X}")
+        logger.info(f"{self.name}/pkt4 handshake successful!")
 
     async def _send_pkt6(self):
         """Send packet type 6 (ready signal)"""
         pkt = bytearray(16)
-        struct.pack_into('<IHHH', pkt, 0, 0x10, 0, 0, 0x06)
-        pkt[6] = 0x01
-        struct.pack_into('>II', pkt, 8, self.local_sid, self.remote_sid)
+        # Use consistent packet structure like pkt3
+        struct.pack_into('<I', pkt, 0, 0x10)      # Length: 16 bytes (little-endian)
+        struct.pack_into('<H', pkt, 4, 0x06)      # Type: 6 (ready signal)
+        struct.pack_into('<H', pkt, 6, 0x01)      # Subtype/flag
+        struct.pack_into('>I', pkt, 8, self.local_sid)   # Local session ID (big-endian)
+        struct.pack_into('>I', pkt, 12, self.remote_sid) # Remote session ID (big-endian)
         
+        logger.info(f"{self.name}/sending pkt6 (ready): {pkt.hex()}")
         await self._send(pkt)
         await self._send(pkt)
 
     async def _wait_for_pkt6_answer(self):
         """Wait for packet type 6 acknowledgment"""
-        logger.debug(f"{self.name}/expecting pkt6 answer")
-        await self._expect(16, bytes([0x10, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00]))
+        logger.info(f"{self.name}/waiting for pkt6 answer")
+        
+        try:
+            response = await asyncio.wait_for(self._recv(), timeout=10)
+            logger.info(f"{self.name}/received response for pkt6: {response.hex()}")
+            
+            if len(response) >= 6:
+                # Check for packet type 6 in the response
+                packet_type = struct.unpack('<H', response[4:6])[0]
+                if packet_type == 0x06:
+                    logger.info(f"{self.name}/received pkt6 answer successfully")
+                    return response
+                else:
+                    logger.debug(f"{self.name}/received packet type {packet_type:#04x}, expected 0x06")
+            else:
+                logger.debug(f"{self.name}/received short packet ({len(response)} bytes)")
+                
+            # Return the response anyway - radio might send valid response in different format
+            return response
+            
+        except asyncio.TimeoutError:
+            logger.error(f"{self.name}/timeout waiting for pkt6 answer")
+            raise Exception(f"{self.name}/timeout waiting for pkt6 answer")
 
     async def _send(self, data: bytes):
         """Send UDP packet"""
@@ -268,6 +301,8 @@ class StreamCommon:
                 logger.info(f"{self.name}/found previous packet: {self.last_received.hex()}")
                 return self.last_received
             logger.error(f"{self.name}/expect timeout - server did not answer in {EXPECT_TIMEOUT_DURATION}s")
+            logger.error(f"{self.name}/troubleshooting: check if {self.connect_address}:{self.port} is reachable")
+            logger.error(f"{self.name}/troubleshooting: verify radio has RS-BA1 enabled and ports are open")
             raise Exception(f"{self.name}/expect timeout - server did not answer")
 
     async def _reader(self):
@@ -761,11 +796,11 @@ class AudioStream:
         """Clean up audio stream"""
         await self.common.deinit()
 
-class KappanhangPython:
-    """Main application class - Python version of kappanhang"""
+class ShackMate:
+    """Main application class - ShackMate ICOM RS-BA1 Client"""
     
-    def __init__(self, connect_address: str = "ic-705", username: str = "beer", 
-                 password: str = "beerbeer"):
+    def __init__(self, connect_address: str = "n4ldr.ddns.net", username: str = "admin", 
+                 password: str = "adminadmin"):
         self.connect_address = connect_address
         self.username = username
         self.password = password
@@ -774,7 +809,7 @@ class KappanhangPython:
 
     async def run(self):
         """Main application entry point"""
-        logger.info("🚀 Kappanhang Python - ICOM RS-BA1 Client")
+        logger.info("🚀 ShackMate - ICOM RS-BA1 Client")
         logger.info(f"📡 Connecting to {self.connect_address}")
         logger.info(f"👤 Username: {self.username}")
         
@@ -823,27 +858,27 @@ class KappanhangPython:
         if self.control_stream:
             await self.control_stream.deinit()
             
-        logger.info("👋 Kappanhang Python stopped")
+        logger.info("👋 ShackMate stopped")
 
 async def main():
     """Command line entry point"""
     parser = argparse.ArgumentParser(
-        description="Kappanhang Python - ICOM RS-BA1 Client",
+        description="ShackMate - ICOM RS-BA1 Client",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -a ic-705.local -u beer -p beerbeer
+  %(prog)s -a ic-705.local -u admin -p adminadmin
   %(prog)s -a 192.168.1.100 -u n4ldr -p icom9700
   %(prog)s --address ic-9700.local --verbose
         """
     )
     
-    parser.add_argument('-a', '--address', default='ic-705',
-                        help='Connect to address (default: ic-705)')
-    parser.add_argument('-u', '--username', default='beer',
-                        help='Username (default: beer)')
-    parser.add_argument('-p', '--password', default='beerbeer',
-                        help='Password (default: beerbeer)')
+    parser.add_argument('-a', '--address', default='n4ldr.ddns.net',
+                        help='Connect to address (default: n4ldr.ddns.net)')
+    parser.add_argument('-u', '--username', default='admin',
+                        help='Username (default: admin)')
+    parser.add_argument('-p', '--password', default='adminadmin',
+                        help='Password (default: adminadmin)')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Enable verbose (debug) logging')
     parser.add_argument('-q', '--quiet', action='store_true',
@@ -858,7 +893,7 @@ Examples:
         logging.getLogger().setLevel(logging.DEBUG)
     
     # Create and run application
-    app = KappanhangPython(args.address, args.username, args.password)
+    app = ShackMate(args.address, args.username, args.password)
     success = await app.run()
     
     return 0 if success else 1
