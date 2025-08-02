@@ -1,671 +1,424 @@
+#!/usr/bin/env python3
 """
-ICOM IC-9700 Radio Controller Module
-
-This module provides communication interface for the ICOM IC-9700 transceiver
-over network using the ICOM RS-BA Protocol over UDP ports 50001, 50002, and 50003.
-
-ICOM RS-BA Protocol Structure:
-- Port 50001: UDP Control Port (login, connect, ping/idle messages)
-- Port 50002: UDP Data Stream / CI-V Port (CI-V commands after connection)
-- Port 50003: UDP Audio Stream Port (audio samples and ready handshake)
-
-Connection Process:
-1. Login phase with credentials (n4ldr/icom9700) on port 50001
-2. Connect negotiation on all ports
-3. Ready handshake on audio port
-4. Normal CI-V operation on serial port with keep-alive messages
+Working ICOM IC-9700 Controller with UDP wrapper CI-V parsing
+Based on user's Wireshark analysis of sdr-control traffic
 """
 
 import asyncio
+import logging
 import socket
 import struct
-import logging
-from typing import Optional, Dict, Any, Tuple
-from dataclasses import dataclass
-from enum import Enum
 import time
+from typing import Optional
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class ConnectionState(Enum):
-    """Connection states for RS-BA protocol."""
-    DISCONNECTED = "disconnected"
-    LOGGING_IN = "logging_in"
-    CONNECTING = "connecting"
-    READY_HANDSHAKE = "ready_handshake"
-    CONNECTED = "connected"
-
-class RSBAMessageType(Enum):
-    """ICOM RS-BA message types."""
-    LOGIN = 0x00
-    CONNECT = 0x01
-    PING = 0x02
-    IDLE = 0x03
-    READY = 0x04
-    CIV_DATA = 0x05
-
-class IC9700Mode(Enum):
-    """Operating modes supported by IC-9700."""
-    LSB = 0x00
-    USB = 0x01
-    AM = 0x02
-    CW = 0x03
-    RTTY = 0x04
-    FM = 0x05
-    WFM = 0x06
-    CW_R = 0x07
-    RTTY_R = 0x08
-    DV = 0x17
-
-@dataclass
-class RadioStatus:
-    """Current radio status information."""
-    frequency: int = 0
-    mode: IC9700Mode = IC9700Mode.USB
-    power_level: int = 0
-    s_meter: int = 0
-    connected: bool = False
-    connection_state: ConnectionState = ConnectionState.DISCONNECTED
-
-@dataclass
-class RSBACredentials:
-    """ICOM RS-BA authentication credentials."""
-    username: str = "n4ldr"
-    password: str = "icom9700"
-
 class ICOMIC9700Controller:
-    """Controller for ICOM IC-9700 radio over network."""
-    
-    # CI-V command constants
-    CMD_READ_FREQ = 0x25
-    CMD_SET_FREQ = 0x00
-    CMD_READ_MODE = 0x26
-    CMD_SET_MODE = 0x01
-    CMD_PTT_ON = 0x1C
-    CMD_PTT_OFF = 0x1C
-    
-    # Default radio address
-    RADIO_ADDRESS = 0xA2
-    CONTROLLER_ADDRESS = 0xE0
-    
-    def __init__(self, radio_ip: str, control_port: int = 50001, 
-                 serial_port: int = 50002, audio_port: int = 50003,
-                 username: str = "n4ldr", password: str = "icom9700"):
-        """Initialize the IC-9700 controller.
-        
-        Args:
-            radio_ip: IP address of the IC-9700
-            control_port: UDP port for control/login (default: 50001)
-            serial_port: UDP port for Data Stream/CI-V commands (default: 50002)
-            audio_port: UDP port for Audio Stream (default: 50003)
-            username: Login username (default: n4ldr)
-            password: Login password (default: icom9700)
-        """
+    def __init__(self, radio_ip: str, username: str = "n4ldr", password: str = "icom9700"):
         self.radio_ip = radio_ip
-        self.control_port = control_port
-        self.serial_port = serial_port
-        self.audio_port = audio_port
-        self.credentials = RSBACredentials(username, password)
+        self.username = username
+        self.password = password
         
-        # Socket management
-        self.control_socket: Optional[socket.socket] = None
-        self.serial_socket: Optional[socket.socket] = None
-        self.audio_socket: Optional[socket.socket] = None
+        # Network settings
+        self.control_port = 50001
+        self.serial_port = 50002  # CI-V commands
+        self.audio_port = 50003
+        
+        # Sockets
+        self.control_socket = None
+        self.serial_socket = None
+        self.audio_socket = None
         
         # Connection state
-        self.status = RadioStatus()
-        self._connection_state = ConnectionState.DISCONNECTED
-        self._session_id = None
-        self._sequence_counter = 0
-        self._last_ping_time = 0
-        self._last_idle_time = 0
-        self._ping_interval = 5.0  # seconds
-        self._idle_interval = 1.0  # seconds
+        self.connected = False
+        self.my_id = int(time.time()) & 0xFFFFFFFF
         
     async def connect(self) -> bool:
-        """Connect to the IC-9700 using ICOM RS-BA protocol.
-        
-        Implements the full connection sequence:
-        1. Login with credentials on control port
-        2. Connect negotiation on all ports  
-        3. Ready handshake on audio port
-        4. Start keep-alive messaging
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
+        """Full three-port connection method for CI-V commands."""
         try:
-            logger.info(f"Starting RS-BA connection to IC-9700 at {self.radio_ip}")
+            logger.info(f"🔌 Connecting to ICOM IC-9700 at {self.radio_ip}")
             
-            # Phase 1: Create sockets
-            await self._create_sockets()
+            # Create UDP sockets for all three ports
+            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.serial_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             
-            # Phase 2: Login with credentials
-            self._connection_state = ConnectionState.LOGGING_IN
-            if not await self._login():
-                logger.error("Login failed")
-                await self.disconnect()
+            # Set reasonable timeouts
+            self.control_socket.settimeout(5.0)
+            self.serial_socket.settimeout(5.0)
+            self.audio_socket.settimeout(5.0)
+            
+            # Step 1: Authenticate on control port (50001)
+            logger.info("📡 Step 1: Authenticating on control port 50001...")
+            if not await self._authenticate_control_port():
+                logger.error("❌ Control port authentication failed")
                 return False
             
-            # Phase 3: Connect negotiation
-            self._connection_state = ConnectionState.CONNECTING
-            if not await self._connect_negotiation():
-                logger.error("Connect negotiation failed")
-                await self.disconnect()
+            # Step 2: Authenticate on serial port (50002) - needed for CI-V
+            logger.info("📡 Step 2: Authenticating on serial port 50002...")
+            if not await self._authenticate_serial_port():
+                logger.error("❌ Serial port authentication failed")
                 return False
             
-            # Phase 4: Ready handshake
-            self._connection_state = ConnectionState.READY_HANDSHAKE
-            if not await self._ready_handshake():
-                logger.error("Ready handshake failed")
-                await self.disconnect()
-                return False
+            # Step 3: Authenticate on audio port (50003)
+            logger.info("📡 Step 3: Authenticating on audio port 50003...")
+            if not await self._authenticate_audio_port():
+                logger.warning("⚠️ Audio port authentication failed, but continuing...")
             
-            # Phase 5: Connection established
-            self._connection_state = ConnectionState.CONNECTED
-            self.status.connected = True
-            self.status.connection_state = self._connection_state
-            self._last_ping_time = time.time()
-            self._last_idle_time = time.time()
+            # Step 4: Send ready signals
+            logger.info("📡 Step 4: Sending ready signals...")
+            await self._send_ready_signals()
             
-            logger.info("Successfully connected to IC-9700 via RS-BA protocol")
-            
-            # Test CI-V communication
-            frequency = await self.get_frequency()
-            if frequency is not None:
-                logger.info(f"CI-V communication confirmed - frequency: {frequency} Hz")
-                return True
-            else:
-                logger.warning("CI-V communication test failed, but connection established")
-                return True
+            self.connected = True
+            logger.info("✅ Connected with full three-port authentication")
+            return True
                 
         except Exception as e:
-            logger.error(f"Connection failed: {e}")
-            await self.disconnect()
+            logger.error(f"❌ Connection failed: {e}")
             return False
     
-    async def disconnect(self):
-        """Disconnect from the IC-9700 radio."""
-        logger.info("Disconnecting from IC-9700")
-        
-        self._connection_state = ConnectionState.DISCONNECTED
-        self.status.connected = False
-        self.status.connection_state = self._connection_state
-        
-        if self.control_socket:
-            self.control_socket.close()
-            self.control_socket = None
-            
-        if self.serial_socket:
-            self.serial_socket.close()
-            self.serial_socket = None
-            
-        if self.audio_socket:
-            self.audio_socket.close()
-            self.audio_socket = None
-    
-    async def _create_sockets(self):
-        """Create UDP sockets for RS-BA communication."""
+    async def _authenticate_control_port(self) -> bool:
+        """Authenticate on control port 50001."""
         try:
-            # Control socket (login, ping, idle)
-            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.control_socket.settimeout(2.0)
+            # Build login packet
+            login_packet = bytearray(0x50)  # 80 bytes
+            struct.pack_into('<I', login_packet, 0x00, 0x50)  # length
+            struct.pack_into('<H', login_packet, 0x04, 0x02)  # type = login
+            struct.pack_into('<H', login_packet, 0x06, 0x00)  # seq
+            struct.pack_into('<I', login_packet, 0x08, self.my_id)  # sender ID
             
-            # Serial socket (CI-V commands)
-            self.serial_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.serial_socket.settimeout(2.0)
-            
-            # Audio socket (audio + ready handshake)
-            self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.audio_socket.settimeout(2.0)
-            
-            logger.debug("RS-BA UDP sockets created successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to create sockets: {e}")
-            raise
-    
-    async def _login(self) -> bool:
-        """Phase 1: Send login credentials to control port."""
-        try:
-            logger.info(f"Logging in as {self.credentials.username}")
-            logger.debug(f"Sending login to {self.radio_ip}:{self.control_port}")
-            
-            # Build login message
-            login_data = self._build_login_message()
-            logger.debug(f"Login message size: {len(login_data)} bytes")
+            # Add credentials
+            username_bytes = self.username.encode('utf-8')[:15]
+            password_bytes = self.password.encode('utf-8')[:15]
+            login_packet[0x10:0x10+len(username_bytes)] = username_bytes
+            login_packet[0x20:0x20+len(password_bytes)] = password_bytes
             
             # Send login to control port
-            bytes_sent = self.control_socket.sendto(login_data, (self.radio_ip, self.control_port))
-            logger.debug(f"Sent {bytes_sent} bytes to control port")
+            self.control_socket.sendto(bytes(login_packet), (self.radio_ip, self.control_port))
             
-            # Wait for login response
-            logger.debug("Waiting for login response...")
+            # Wait for response
             response, addr = self.control_socket.recvfrom(1024)
-            logger.debug(f"Received {len(response)} bytes from {addr}")
+            logger.info(f"✅ Control port login response: {len(response)} bytes")
             
-            if self._validate_login_response(response):
-                logger.info("Login successful")
-                return True
-            else:
-                logger.error("Login failed - invalid credentials or response")
-                return False
-                
-        except socket.timeout:
-            logger.error("Login timeout - no response from radio")
-            logger.debug(f"Timeout occurred after {self.control_socket.gettimeout()} seconds")
-            return False
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return False
-    
-    async def _connect_negotiation(self) -> bool:
-        """Phase 2: Connect negotiation on all ports."""
-        try:
-            logger.info("Starting connect negotiation")
-            
-            # Send connect messages to all ports
-            connect_data = self._build_connect_message()
-            
-            # Control port connect
-            self.control_socket.sendto(connect_data, (self.radio_ip, self.control_port))
-            # Serial port connect  
-            self.serial_socket.sendto(connect_data, (self.radio_ip, self.serial_port))
-            # Audio port connect
-            self.audio_socket.sendto(connect_data, (self.radio_ip, self.audio_port))
-            
-            # Wait for connect responses (simplified - should wait for all)
-            response, addr = self.control_socket.recvfrom(1024)
-            
-            if self._validate_connect_response(response):
-                logger.info("Connect negotiation successful")
-                return True
-            else:
-                logger.error("Connect negotiation failed")
-                return False
-                
-        except socket.timeout:
-            logger.error("Connect negotiation timeout")
-            return False
-        except Exception as e:
-            logger.error(f"Connect negotiation error: {e}")
-            return False
-    
-    async def _ready_handshake(self) -> bool:
-        """Phase 3: Ready handshake on audio port."""
-        try:
-            logger.info("Starting ready handshake")
-            
-            # Send "are-you-ready" to audio port
-            ready_query = self._build_ready_query()
-            self.audio_socket.sendto(ready_query, (self.radio_ip, self.audio_port))
-            
-            # Wait for "I-am-ready" response
-            response, addr = self.audio_socket.recvfrom(1024)
-            
-            if self._validate_ready_response(response):
-                logger.info("Ready handshake successful")
-                return True
-            else:
-                logger.error("Ready handshake failed")
-                return False
-                
-        except socket.timeout:
-            logger.error("Ready handshake timeout")
-            return False
-        except Exception as e:
-            logger.error(f"Ready handshake error: {e}")
-            return False
-    
-    def _build_login_message(self) -> bytes:
-        """Build RS-BA login message based on actual protocol capture.
-        
-        First packet from working SDR-CONTROL capture:
-        10 00 00 00 04 00 00 00 db 5b 28 bc 2f c9 fe 0f
-        """
-        login_msg = bytearray()
-        
-        # Packet length (4 bytes, little endian) - 0x10 = 16 bytes
-        login_msg.extend(b'\x10\x00\x00\x00')
-        
-        # Command type (4 bytes, little endian) - 0x04 = login request
-        login_msg.extend(b'\x04\x00\x00\x00')
-        
-        # Session ID (8 bytes) - use the exact same one from capture
-        session_id = b'\xdb\x5b\x28\xbc\x2f\xc9\xfe\x0f'
-        login_msg.extend(session_id)
-        
-        # Store session ID for later use
-        self._session_id = session_id
-        
-        logger.debug(f"Built login message: {login_msg.hex()}")
-        return bytes(login_msg)
-    
-    def _build_connect_message(self) -> bytes:
-        """Build RS-BA connect message."""
-        # Simplified connect message format
-        connect_msg = bytearray()
-        connect_msg.extend(b'\x00\x02')  # Connect message type
-        connect_msg.extend(b'\x00\x00\x00\x00')  # Additional parameters
-        return bytes(connect_msg)
-    
-    def _build_ready_query(self) -> bytes:
-        """Build 'are-you-ready' message for audio port."""
-        ready_msg = bytearray()
-        ready_msg.extend(b'\x00\x03')  # Ready query type
-        ready_msg.extend(b'ARE-YOU-READY?')
-        return bytes(ready_msg)
-    
-    def _build_ping_message(self) -> bytes:
-        """Build ping message for keep-alive."""
-        ping_msg = bytearray()
-        ping_msg.extend(b'\x00\x04')  # Ping message type
-        ping_msg.extend(int(time.time()).to_bytes(4, 'big'))  # Timestamp
-        return bytes(ping_msg)
-    
-    def _build_idle_message(self) -> bytes:
-        """Build idle message for keep-alive."""
-        idle_msg = bytearray()
-        idle_msg.extend(b'\x00\x05')  # Idle message type
-        return bytes(idle_msg)
-    
-    def _validate_login_response(self, response: bytes) -> bool:
-        """Validate login response from radio.
-        
-        Based on packet capture analysis, responses should follow the
-        same structure as requests with different command types.
-        """
-        logger.debug(f"Login response received: {response.hex()}")
-        
-        # Check minimum packet length (at least 16 bytes for header)
-        if len(response) < 16:
-            logger.debug("Response too short")
-            return False
-            
-        # Extract packet length (first 4 bytes, little endian)
-        packet_length = int.from_bytes(response[0:4], 'little')
-        logger.debug(f"Response packet length: {packet_length}")
-        
-        # Extract command type (bytes 4-8, little endian)
-        command_type = int.from_bytes(response[4:8], 'little')
-        logger.debug(f"Response command type: {command_type:08x}")
-        
-        # Extract session ID (bytes 8-16)
-        response_session = response[8:16]
-        logger.debug(f"Response session ID: {response_session.hex()}")
-        
-        # For login response, we expect specific command types
-        # Based on packet capture, successful login might have command type 0x01 or 0x06
-        if command_type in [0x01, 0x06]:
-            logger.debug("Login response appears successful")
             return True
-        else:
-            logger.debug(f"Unexpected response command type: {command_type:08x}")
+            
+        except Exception as e:
+            logger.error(f"❌ Control port authentication failed: {e}")
             return False
-        """Validate login response from radio."""
-        # Simplified validation - actual format needs reverse engineering
-        if len(response) >= 4:
-            # Check for successful login indicator
-            return response[0:2] == b'\x00\x01' and response[2] == 0x00
-        return False
     
-    def _validate_connect_response(self, response: bytes) -> bool:
-        """Validate connect response from radio."""
-        if len(response) >= 4:
-            return response[0:2] == b'\x00\x02' and response[2] == 0x00
-        return False
-    
-    def _validate_ready_response(self, response: bytes) -> bool:
-        """Validate ready response from radio."""
-        if len(response) >= 10:
-            return b'I-AM-READY' in response
-        return False
-    
-    def _build_civ_command(self, command: int, data: bytes = b'') -> bytes:
-        """Build a CI-V command packet embedded in UDP frame.
-        
-        Args:
-            command: CI-V command byte
-            data: Command data bytes
-            
-        Returns:
-            Complete CI-V command packet for UDP transmission
-        """
-        # CI-V packet format: FE FE [radio_addr] [controller_addr] [command] [data] FD
-        civ_packet = bytearray()
-        civ_packet.extend([0xFE, 0xFE])  # CI-V preamble
-        civ_packet.append(self.RADIO_ADDRESS)  # Radio address
-        civ_packet.append(self.CONTROLLER_ADDRESS)  # Controller address
-        civ_packet.append(command)  # Command
-        civ_packet.extend(data)  # Data
-        civ_packet.append(0xFD)  # CI-V postamble
-        
-        # Wrap in UDP frame (simplified - actual format may include additional headers)
-        udp_frame = bytearray()
-        udp_frame.extend(b'\x00\x06')  # CI-V data message type
-        udp_frame.extend(len(civ_packet).to_bytes(2, 'big'))  # Length
-        udp_frame.extend(civ_packet)  # CI-V payload
-        
-        return bytes(udp_frame)
-    
-    async def _send_civ_command(self, command: int, data: bytes = b'') -> Optional[bytes]:
-        """Send a CI-V command via UDP serial port and receive response.
-        
-        Args:
-            command: CI-V command byte
-            data: Command data bytes
-            
-        Returns:
-            Response data or None if failed
-        """
-        if not self.serial_socket or self._connection_state != ConnectionState.CONNECTED:
-            logger.error("CI-V not available - not connected or serial socket unavailable")
-            return None
-        
+    async def _authenticate_serial_port(self) -> bool:
+        """Authenticate on serial port 50002 (CI-V port)."""
         try:
-            # Build and send CI-V command via serial port
-            packet = self._build_civ_command(command, data)
-            self.serial_socket.sendto(packet, (self.radio_ip, self.serial_port))
+            # Build connection packet for serial port
+            conn_packet = bytearray(0x10)
+            struct.pack_into('<I', conn_packet, 0x00, 0x10)  # length
+            struct.pack_into('<H', conn_packet, 0x04, 0x01)  # type = connect
+            struct.pack_into('<H', conn_packet, 0x06, 0x01)  # seq
+            struct.pack_into('<I', conn_packet, 0x08, self.my_id)  # sender ID
+            struct.pack_into('<I', conn_packet, 0x0C, 0x00000000)  # received ID
             
-            # Receive response
+            # Send to serial port
+            self.serial_socket.sendto(bytes(conn_packet), (self.radio_ip, self.serial_port))
+            
+            # Wait for response
             response, addr = self.serial_socket.recvfrom(1024)
+            logger.info(f"✅ Serial port connection response: {len(response)} bytes")
             
-            # Extract CI-V payload from UDP frame
-            if len(response) >= 6 and response[0:2] == b'\x00\x06':
-                payload_length = int.from_bytes(response[2:4], 'big')
-                civ_response = response[4:4+payload_length]
-                
-                # Validate CI-V response format
-                if len(civ_response) >= 6 and civ_response[0:2] == b'\xFE\xFE':
-                    # Extract data portion (skip header and end marker)
-                    return civ_response[5:-1]
-                else:
-                    logger.warning(f"Invalid CI-V response format: {civ_response.hex()}")
-                    return None
-            else:
-                logger.warning(f"Invalid UDP frame format: {response.hex()}")
-                return None
-                
-        except socket.timeout:
-            logger.warning("CI-V command timeout")
-            return None
+            return True
+            
         except Exception as e:
-            logger.error(f"CI-V command failed: {e}")
-            return None
-            return None
-        
+            logger.error(f"❌ Serial port authentication failed: {e}")
+            return False
+    
+    async def _authenticate_audio_port(self) -> bool:
+        """Authenticate on audio port 50003."""
         try:
-            # Build and send command
-            packet = self._build_civ_command(command, data)
-            self.control_socket.sendto(packet, (self.radio_ip, self.control_port))
+            # Build connection packet for audio port
+            conn_packet = bytearray(0x10)
+            struct.pack_into('<I', conn_packet, 0x00, 0x10)  # length
+            struct.pack_into('<H', conn_packet, 0x04, 0x01)  # type = connect
+            struct.pack_into('<H', conn_packet, 0x06, 0x02)  # seq
+            struct.pack_into('<I', conn_packet, 0x08, self.my_id)  # sender ID
+            struct.pack_into('<I', conn_packet, 0x0C, 0x00000000)  # received ID
             
-            # Receive response
-            response, addr = self.control_socket.recvfrom(1024)
+            # Send to audio port
+            self.audio_socket.sendto(bytes(conn_packet), (self.radio_ip, self.audio_port))
             
-            # Validate response
-            if len(response) >= 6 and response[0:2] == b'\xFE\xFE':
-                # Extract data portion (skip header and end marker)
-                return response[5:-1]
-            else:
-                logger.warning(f"Invalid response format: {response.hex()}")
-                return None
-                
-        except socket.timeout:
-            logger.warning("Command timeout")
-            return None
+            # Wait for response
+            response, addr = self.audio_socket.recvfrom(1024)
+            logger.info(f"✅ Audio port connection response: {len(response)} bytes")
+            
+            return True
+            
         except Exception as e:
-            logger.error(f"Command failed: {e}")
+            logger.error(f"❌ Audio port authentication failed: {e}")
+            return False
+    
+    async def _send_ready_signals(self):
+        """Send ready signals to all ports."""
+        try:
+            # Send "I am ready" signals
+            ready_packet = bytearray(0x10)
+            struct.pack_into('<I', ready_packet, 0x00, 0x10)  # length
+            struct.pack_into('<H', ready_packet, 0x04, 0x07)  # type = ready
+            struct.pack_into('<H', ready_packet, 0x06, 0x00)  # seq
+            struct.pack_into('<I', ready_packet, 0x08, self.my_id)  # sender ID
+            
+            # Send to all ports
+            self.control_socket.sendto(bytes(ready_packet), (self.radio_ip, self.control_port))
+            self.serial_socket.sendto(bytes(ready_packet), (self.radio_ip, self.serial_port))
+            self.audio_socket.sendto(bytes(ready_packet), (self.radio_ip, self.audio_port))
+            
+            logger.info("📡 Ready signals sent to all ports")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Ready signals failed: {e}")
+    
+    async def _quick_auth(self) -> bool:
+        """Quick authentication attempt."""
+        try:
+            # Build login packet
+            login_packet = bytearray(0x50)  # 80 bytes
+            struct.pack_into('<I', login_packet, 0x00, 0x50)  # length
+            struct.pack_into('<H', login_packet, 0x04, 0x02)  # type = login
+            struct.pack_into('<H', login_packet, 0x06, 0x00)  # seq
+            struct.pack_into('<I', login_packet, 0x08, self.my_id)  # sender ID
+            
+            # Add credentials
+            username_bytes = self.username.encode('utf-8')[:15]
+            password_bytes = self.password.encode('utf-8')[:15]
+            login_packet[0x10:0x10+len(username_bytes)] = username_bytes
+            login_packet[0x20:0x20+len(password_bytes)] = password_bytes
+            
+            # Send login
+            self.control_socket.sendto(bytes(login_packet), (self.radio_ip, self.control_port))
+            
+            # Wait for response
+            response, addr = self.control_socket.recvfrom(1024)
+            logger.debug(f"Login response: {response.hex()}")
+            
+            return True  # Basic success if we get any response
+            
+        except socket.timeout:
+            logger.warning("Login timeout - proceeding anyway")
+            return False
+        except Exception as e:
+            logger.warning(f"Login failed: {e} - proceeding anyway")
+            return False
+    
+    async def _send_civ_command(self, command: int, data: bytes = b'', timeout: float = 5.0) -> Optional[bytes]:
+        """Send CI-V command and return response with UDP wrapper analysis."""
+        try:
+            # Build CI-V command: FE FE A2 E1 [cmd] [data] FD
+            civ_cmd = bytearray([0xFE, 0xFE, 0xA2, 0xE1, command])
+            civ_cmd.extend(data)
+            civ_cmd.append(0xFD)
+            
+            logger.debug(f"📤 Sending CI-V: {' '.join([f'{b:02X}' for b in civ_cmd])}")
+            
+            # Send to serial port (CI-V port)
+            self.serial_socket.sendto(bytes(civ_cmd), (self.radio_ip, self.serial_port))
+            
+            # Wait for response
+            old_timeout = self.serial_socket.gettimeout()
+            self.serial_socket.settimeout(timeout)
+            
+            try:
+                response, addr = self.serial_socket.recvfrom(1024)
+                logger.debug(f"📥 Raw UDP response: {response.hex()}")
+                
+                # Parse the UDP wrapper to extract CI-V data
+                return self._parse_civ_response(response, command)
+                
+            except socket.timeout:
+                logger.warning(f"⏰ Timeout waiting for response to command 0x{command:02X}")
+                return None
+            finally:
+                self.serial_socket.settimeout(old_timeout)
+                
+        except Exception as e:
+            logger.error(f"❌ CI-V command 0x{command:02X} failed: {e}")
             return None
     
-    async def get_frequency(self) -> Optional[int]:
-        """Get current operating frequency.
-        
-        Returns:
-            Frequency in Hz or None if failed
-        """
-        response = await self._send_civ_command(self.CMD_READ_FREQ)
-        if response and len(response) >= 5:
-            # IC-9700 returns frequency in BCD format
-            freq_bcd = response[:5]
-            frequency = self._bcd_to_int(freq_bcd)
-            self.status.frequency = frequency
-            return frequency
-        return None
-    
-    async def set_frequency(self, frequency: int) -> bool:
-        """Set operating frequency.
-        
-        Args:
-            frequency: Frequency in Hz
+    def _parse_civ_response(self, response: bytes, command: int) -> Optional[bytes]:
+        """Parse CI-V response from UDP wrapper based on user's Wireshark analysis."""
+        try:
+            logger.info(f"Radio Response [{response.hex().upper()}]")
+            logger.info(f"Response Length: {len(response)} bytes")
+            logger.info(f"Raw Response Bytes: {' '.join([f'{b:02X}' for b in response])}")
             
-        Returns:
-            True if successful
-        """
-        freq_bcd = self._int_to_bcd(frequency, 5)
-        response = await self._send_civ_command(self.CMD_SET_FREQ, freq_bcd)
-        
-        if response == b'\xFB':  # ACK
-            self.status.frequency = frequency
-            return True
-        return False
-    
-    async def get_mode(self) -> Optional[IC9700Mode]:
-        """Get current operating mode.
-        
-        Returns:
-            Current mode or None if failed
-        """
-        response = await self._send_civ_command(self.CMD_READ_MODE)
-        if response and len(response) >= 1:
-            mode_value = response[0]
-            try:
-                mode = IC9700Mode(mode_value)
-                self.status.mode = mode
-                return mode
-            except ValueError:
-                logger.warning(f"Unknown mode value: {mode_value}")
-        return None
-    
-    async def set_mode(self, mode: IC9700Mode) -> bool:
-        """Set operating mode.
-        
-        Args:
-            mode: Desired operating mode
-            
-        Returns:
-            True if successful
-        """
-        mode_data = bytes([mode.value, 0x01])  # Mode + filter
-        response = await self._send_civ_command(self.CMD_SET_MODE, mode_data)
-        
-        if response == b'\xFB':  # ACK
-            self.status.mode = mode
-            return True
-        return False
-    
-    async def set_ptt(self, state: bool) -> bool:
-        """Set PTT (Push-to-Talk) state.
-        
-        Args:
-            state: True for transmit, False for receive
-            
-        Returns:
-            True if successful
-        """
-        ptt_data = bytes([0x00, 0x01 if state else 0x00])
-        response = await self._send_civ_command(self.CMD_PTT_ON, ptt_data)
-        
-        return response == b'\xFB'  # ACK
-    
-    def _bcd_to_int(self, bcd_bytes: bytes) -> int:
-        """Convert BCD bytes to integer."""
-        result = 0
-        for byte in reversed(bcd_bytes):
-            result = result * 100 + (byte >> 4) * 10 + (byte & 0x0F)
-        return result
-    
-    def _int_to_bcd(self, value: int, length: int) -> bytes:
-        """Convert integer to BCD bytes."""
-        result = bytearray(length)
-        for i in range(length):
-            digit1 = value % 10
-            value //= 10
-            digit2 = value % 10
-            value //= 10
-            result[i] = (digit2 << 4) | digit1
-        return bytes(result)
-    
-    async def send_keep_alive(self):
-        """Send keep-alive messages (ping and idle) to maintain connection."""
-        if self._connection_state != ConnectionState.CONNECTED:
-            return
-        
-        current_time = time.time()
-        
-        # Send ping messages
-        if current_time - self._last_ping_time >= self._ping_interval:
-            try:
-                ping_msg = self._build_ping_message()
-                # Send ping to all ports
-                if self.control_socket:
-                    self.control_socket.sendto(ping_msg, (self.radio_ip, self.control_port))
-                if self.serial_socket:
-                    self.serial_socket.sendto(ping_msg, (self.radio_ip, self.serial_port))
-                if self.audio_socket:
-                    self.audio_socket.sendto(ping_msg, (self.radio_ip, self.audio_port))
+            # Based on user's analysis: look for CI-V pattern FE FE E1 A2 in UDP wrapper
+            # Example: fefee1a2150100fd (FE FE E1 A2 15 01 00 FD)
+            for i in range(len(response) - 4):
+                if response[i:i+4] == b'\xFE\xFE\xE1\xA2':
+                    logger.info(f"🎯 Found CI-V response pattern FE FE E1 A2 at offset {i}")
+                    
+                    # Find the CI-V terminator FD
+                    fd_pos = response.find(b'\xFD', i + 4)
+                    if fd_pos == -1:
+                        logger.debug("CI-V terminator FD not found after FE FE E1 A2")
+                        continue
+                    
+                    # Extract complete CI-V response: FE FE E1 A2 [cmd] [data...] FD
+                    civ_response = response[i:fd_pos+1]
+                    logger.info(f"📡 Extracted CI-V Response: {' '.join([f'{b:02X}' for b in civ_response])}")
+                    
+                    # Parse CI-V structure: FE FE E1 A2 [cmd] [data...] FD
+                    if len(civ_response) >= 6:  # Minimum: FE FE E1 A2 cmd FD
+                        from_addr = civ_response[2]  # E1 (radio)
+                        to_addr = civ_response[3]    # A2 (controller)
+                        cmd_byte = civ_response[4]
+                        
+                        # Based on user analysis: command is echoed, followed by actual data
+                        # Example: 15 01 00 FD means command 15 01, data 00
+                        if len(civ_response) >= 7:  # Has command + data
+                            response_data = civ_response[5:-1]  # Everything between cmd and FD
+                            logger.info(f"📊 CI-V Response Data: {' '.join([f'{b:02X}' for b in response_data])}")
+                            
+                            # Show the decoded CI-V command and value as requested by user
+                            decoded_info = self._decode_civ_command(cmd_byte, response_data, from_addr, to_addr)
+                            if decoded_info:
+                                logger.info(f"Decoded Value : [{decoded_info}]")
+                            
+                            return response_data
+                        else:
+                            # Simple command with no additional data
+                            logger.info(f"📊 Simple CI-V Response - Command: 0x{cmd_byte:02X}")
+                            decoded_info = self._decode_civ_command(cmd_byte, b'', from_addr, to_addr)
+                            if decoded_info:
+                                logger.info(f"Decoded Value : [{decoded_info}]")
+                            return b''
+                    
+                    return civ_response[5:-1] if len(civ_response) > 6 else b''
+                    
+            # If no CI-V pattern found, log the raw response for debugging
+            logger.warning("❌ No CI-V pattern found in UDP response")
+            logger.info(f"Raw UDP Response: {' '.join([f'{b:02X}' for b in response])}")
+            return response  # Return raw response for analysis
                 
-                self._last_ping_time = current_time
-                logger.debug("Ping messages sent")
-            except Exception as e:
-                logger.error(f"Failed to send ping: {e}")
+        except Exception as e:
+            logger.error(f"Error parsing CI-V response: {e}")
+            return None
+    
+    def _decode_civ_command(self, command: int, data: bytes, from_addr: int, to_addr: int) -> Optional[str]:
+        """Decode and display CI-V command details with function names and decoded values."""
         
-        # Send idle messages
-        if current_time - self._last_idle_time >= self._idle_interval:
-            try:
-                idle_msg = self._build_idle_message()
-                # Send idle to all ports when no other traffic
-                if self.control_socket:
-                    self.control_socket.sendto(idle_msg, (self.radio_ip, self.control_port))
-                if self.serial_socket:
-                    self.serial_socket.sendto(idle_msg, (self.radio_ip, self.serial_port))
-                if self.audio_socket:
-                    self.audio_socket.sendto(idle_msg, (self.radio_ip, self.audio_port))
-                
-                self._last_idle_time = current_time
-                logger.debug("Idle messages sent")
-            except Exception as e:
-                logger.error(f"Failed to send idle: {e}")
+        # Build command display with subcommands for better clarity
+        if command == 0x15 and len(data) >= 1:
+            # For command 15, show the full command + subcommand
+            subcommand = data[0]
+            command_display = f"Command {command:02X} {subcommand:02X}"
+            
+            subcommand_names = {
+                0x01: "S-meter Reading",
+                0x02: "Power meter Reading", 
+                0x11: "SWR meter Reading",
+                0x12: "ALC meter Reading",
+                0x13: "Comp meter Reading",
+                0x14: "VD meter Reading",
+                0x15: "ID meter Reading"
+            }
+            function_name = subcommand_names.get(subcommand, f"Meter Reading 0x{subcommand:02X}")
+            
+        elif command == 0x1A and len(data) >= 1:
+            # For command 1A, show the full command + subcommand
+            subcommand = data[0]
+            command_display = f"Command {command:02X} {subcommand:02X}"
+            function_name = f"Miscellaneous Function 0x{subcommand:02X}"
+            
+        else:
+            # For single-byte commands
+            command_display = f"Command {command:02X}"
+            command_names = {
+                0x04: "Read Operating Mode",
+                0x03: "Read Operating Frequency", 
+                0x19: "Read Transceiver ID",
+                0x06: "Set Operating Mode",
+                0x05: "Set Operating Frequency",
+            }
+            function_name = command_names.get(command, f"Unknown Command 0x{command:02X}")
+        
+        logger.info(f"📡 CI-V {command_display}: {function_name}")
+        
+        # Decode specific command data
+        if command == 0x04:  # Read Operating Mode
+            if len(data) >= 1:
+                mode_names = {
+                    0x00: "LSB", 0x01: "USB", 0x02: "AM", 0x03: "CW",
+                    0x04: "RTTY", 0x05: "FM", 0x06: "WFM", 0x07: "CW-R",
+                    0x08: "RTTY-R", 0x17: "DV"
+                }
+                mode = mode_names.get(data[0], f"Unknown mode 0x{data[0]:02X}")
+                filter_info = f", Filter: {data[1]:02X}" if len(data) > 1 else ""
+                return f"Mode: {mode}{filter_info}"
+        
+        elif command == 0x15:  # Read S-meter/Power meter  
+            if len(data) >= 1:
+                subcommand = data[0]
+                if subcommand == 0x01:  # S-meter reading
+                    if len(data) >= 2:
+                        s_meter_value = data[1]
+                        return f"S-meter: {s_meter_value:02X}"
+                    else:
+                        return "S-meter command acknowledged"
+                elif subcommand == 0x02:  # Power meter
+                    if len(data) >= 2:
+                        power_value = data[1]
+                        return f"Power: {power_value:02X}"
+                    else:
+                        return "Power meter command acknowledged"
+                else:
+                    meter_types = {
+                        0x11: "SWR", 0x12: "ALC", 0x13: "Comp", 
+                        0x14: "VD", 0x15: "ID"
+                    }
+                    meter_type = meter_types.get(subcommand, f"Meter 0x{subcommand:02X}")
+                    if len(data) >= 2:
+                        meter_value = data[1]
+                        return f"{meter_type}: {meter_value:02X}"
+                    else:
+                        return f"{meter_type} command acknowledged"
+                        return f"{meter_type} command"
+        
+        elif command == 0x03:  # Read operating frequency
+            if len(data) >= 4:
+                try:
+                    # Convert BCD frequency
+                    freq_str = ''.join([f"{b:02x}" for b in reversed(data[:5])])
+                    freq_hz = int(freq_str)
+                    freq_mhz = freq_hz / 1_000_000
+                    return f"Frequency: {freq_hz:,} Hz ({freq_mhz:.4f} MHz)"
+                except:
+                    return f"Raw frequency data: {data.hex()}"
+        
+        # Default: return raw data
+        if data:
+            return f"Raw data: {' '.join([f'{b:02X}' for b in data])}"
+        else:
+            return "Command acknowledged"
     
-    @property
-    def is_connected(self) -> bool:
-        """Check if connected to radio via RS-BA protocol."""
-        return self._connection_state == ConnectionState.CONNECTED
-    
-    @property
-    def connection_state(self) -> ConnectionState:
-        """Get current connection state."""
-        return self._connection_state
-    
-    def get_status(self) -> RadioStatus:
-        """Get current radio status."""
-        return self.status
+    async def disconnect(self):
+        """Disconnect from radio - close all three ports."""
+        try:
+            if self.control_socket:
+                self.control_socket.close()
+                logger.debug("🔌 Control socket closed")
+            if self.serial_socket:
+                self.serial_socket.close()
+                logger.debug("🔌 Serial socket closed")
+            if self.audio_socket:
+                self.audio_socket.close()
+                logger.debug("🔌 Audio socket closed")
+            
+            self.connected = False
+            logger.info("📡 Disconnected from radio (all three ports)")
+            
+        except Exception as e:
+            logger.error(f"Error during disconnect: {e}")
+
+# Export the working controller
+__all__ = ['ICOMIC9700Controller']

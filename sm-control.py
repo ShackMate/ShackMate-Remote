@@ -46,11 +46,13 @@ class SMControlApp:
         
         try:
             # Connect to the radio
-            await self.radio_controller.connect()
-            logger.info("Successfully connected to ICOM IC-9700")
-            
-            self.running = True
-            await self.main_loop()
+            if await self.radio_controller.connect():
+                logger.info("Successfully connected to ICOM IC-9700")
+                self.running = True
+                await self.main_loop()
+            else:
+                logger.error("Failed to connect to ICOM IC-9700")
+                return
             
         except Exception as e:
             logger.error(f"Failed to start SM-Control: {e}")
@@ -74,22 +76,17 @@ class SMControlApp:
                 # Send keep-alive messages to maintain connection
                 await self.radio_controller.send_keep_alive()
                 
-                # Example: Get current frequency
-                frequency = await self.radio_controller.get_frequency()
-                if frequency:
-                    logger.info(f"Current frequency: {frequency:,} Hz")
-                
-                # Example: Get current mode
-                mode = await self.radio_controller.get_mode()
-                if mode:
-                    logger.info(f"Current mode: {mode.name}")
+                # Run comprehensive CI-V command test suite
+                logger.info("🔧 Running CI-V command tests...")
+                await self.radio_controller.test_civ_commands()
                 
                 # Log connection state
                 state = self.radio_controller.connection_state
-                logger.debug(f"Connection state: {state.value}")
+                logger.info(f"Connection state: {state.value}")
                 
-                # Wait before next update
-                await asyncio.sleep(5)
+                # Wait before next test cycle
+                logger.info("⏱️  Waiting 15 seconds before next test cycle...")
+                await asyncio.sleep(15)
                 
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
